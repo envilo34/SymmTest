@@ -1,5 +1,7 @@
 from __future__ import annotations
+import csv
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional
 import heapq
 import math
@@ -9,7 +11,28 @@ from config import EmiliaTunnelConfig, DEFAULT_CONFIG
 from .tunnel import TunnelGeometry, Obstacle
 from .agents import Person, PersonState
 from .smoke import SmokeField, FireSource, VentilationFan
+from .cfd_module import SimpleLBMModule
+from .pysph_bridge import PySPHAdapter
 from .events import SimEvent
+
+
+@dataclass
+class SimulationRecorder:
+    """Stores time series of aggregate results and allows CSV export."""
+
+    entries: List[dict] = field(default_factory=list)
+
+    def record(self, stats: dict) -> None:
+        self.entries.append(stats.copy())
+
+    def to_csv(self, path: Path) -> None:
+        if not self.entries:
+            return
+        keys = list(self.entries[0].keys())
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(self.entries)
 
 
 @dataclass
@@ -20,6 +43,7 @@ class Simulation:
     persons: List[Person] = field(default_factory=list)
 
     current_time_s: float = 0.0
+    recorder: SimulationRecorder = field(default_factory=SimulationRecorder)
     _event_queue: List[SimEvent] = field(default_factory=list, init=False)
     _next_event_priority: int = 0
     _next_person_id: int = 1
@@ -31,6 +55,8 @@ class Simulation:
     def __post_init__(self):
         self.geometry = TunnelGeometry.from_emilia(self.cfg)
         self.smoke = SmokeField.from_emilia(self.cfg)
+        # attach lightweight LBM-inspired module by default for richer flow
+        self.attach_lbm_module()
 
     # --- events management  -----------------------------------------
 
@@ -92,10 +118,6 @@ class Simulation:
             )
             self.geometry.obstacles.append(obs)
             self.geometry._build_wall_segments()
-        elif kind == "set_air_velocity":
-            vx = float(p.get("vx_mps", self.cfg.default_air_velocity_x_mps))
-            vy = float(p.get("vy_mps", self.cfg.default_air_velocity_y_mps))
-            self.smoke.set_air_velocity(vx, vy, self.cfg)
         elif kind == "add_fan":
             x = float(p.get("x_m", self.cfg.length_m / 2.0))
             y = float(p.get("y_m", self.cfg.width_m - 0.5))  # eg. „ceil”
@@ -155,12 +177,14 @@ class Simulation:
         self.current_time_s = 0.0
         self.persons.clear()
         self.smoke = SmokeField.from_emilia(self.cfg)
+        self.attach_lbm_module()
         self._event_queue.clear()
         self._next_event_priority = 0
         self._next_person_id = 1
         self.voice_alarm_active = False
         self.fire_position = None
         self.geometry = TunnelGeometry.from_emilia(self.cfg)
+        self.recorder = SimulationRecorder()
 
     def step(self) -> None:
         dt = self.cfg.dt_s
@@ -174,6 +198,9 @@ class Simulation:
 
         # 3) pedestrians
         self._update_persons(dt)
+
+        # 4) logging
+        self.recorder.record(self.statistics())
 
     # --- move model details / behavior -----------------------------
 
@@ -399,6 +426,15 @@ class Simulation:
             p.x = max(0.0, min(self.cfg.length_m, p.x))
             p.y = max(0.0, min(self.cfg.width_m, p.y))
 
+            # prevent penetration into vehicles/seats/obstacles
+            new_x, new_y = self.geometry.resolve_obstacle_collision(
+                (p.x, p.y), p.radius_m
+            )
+            if abs(new_x - p.x) > 1e-6 or abs(new_y - p.y) > 1e-6:
+                p.x, p.y = new_x, new_y
+                p.vx = 0.0
+                p.vy = 0.0
+
             # checking if he reached the exit
             if self.geometry.is_at_exit((p.x, p.y), tol_m=1.0):
                 p.mark_safe()
@@ -440,6 +476,18 @@ class Simulation:
             "walking": walking,
             "waiting": waiting,
         }
+
+    def export_csv(self, path: str | Path) -> None:
+        """Export recorded statistics to CSV."""
+        self.recorder.to_csv(Path(path))
+
+    # --- flow coupling --------------------------------------------------
+
+    def attach_lbm_module(self, strength: float = 0.5, bias: float = 0.2) -> None:
+        self.smoke.attach_external_flow_provider(SimpleLBMModule(strength, bias))
+
+    def attach_pysph_adapter(self, solver: object | None = None) -> None:
+        self.smoke.attach_external_flow_provider(PySPHAdapter(solver))
 
     # --- example scenario for Emilia ------------------------------
 
@@ -485,6 +533,109 @@ class Simulation:
             vx_mps=3.0,
             vy_mps=0.0,
         )
+
+    # --- Laliki tunnel bus evacuation ----------------------------------
+
+    def _build_bus_layout(self, center_x: float, center_y: float) -> List[tuple[float, float]]:
+        cfg = self.cfg
+        g = self.geometry
+        g.obstacles.clear()
+
+        half_L = cfg.bus_length_m / 2.0
+        half_W = cfg.bus_width_m / 2.0
+        seat_width = (cfg.bus_width_m - cfg.bus_aisle_width_m - 2 * cfg.bus_wall_thickness_m) / 2.0
+        t = cfg.bus_wall_thickness_m
+
+        x_min = center_x - half_L
+        x_max = center_x + half_L
+        y_min = center_y - half_W
+        y_max = center_y + half_W
+
+        # left wall
+        g.obstacles.append(Obstacle(x_min, y_min, x_max, y_min + t))
+        # right wall split by door
+        door_x0 = x_max - 2.0
+        door_x1 = door_x0 + cfg.bus_door_width_m
+        g.obstacles.append(Obstacle(x_min, y_max - t, door_x0, y_max))
+        g.obstacles.append(Obstacle(door_x1, y_max - t, x_max, y_max))
+        # front/back
+        g.obstacles.append(Obstacle(x_min, y_min, x_min + t, y_max))
+        g.obstacles.append(Obstacle(x_max - t, y_min, x_max, y_max))
+
+        seat_centers: List[tuple[float, float]] = []
+        rows = int(cfg.bus_length_m / cfg.bus_row_spacing_m)
+        left_y0 = y_min + t
+        right_y0 = y_min + t + seat_width + cfg.bus_aisle_width_m
+
+        for i in range(rows):
+            sx0 = x_min + t + i * cfg.bus_row_spacing_m
+            sx1 = sx0 + cfg.bus_seat_depth_m
+            # left seats
+            sy_left0 = left_y0
+            sy_left1 = sy_left0 + seat_width
+            g.obstacles.append(Obstacle(sx0, sy_left0, sx1, sy_left1))
+            seat_centers.append(((sx0 + sx1) / 2.0, (sy_left0 + sy_left1) / 2.0))
+
+            # right seats
+            sy_right0 = right_y0
+            sy_right1 = sy_right0 + seat_width
+            g.obstacles.append(Obstacle(sx0, sy_right0, sx1, sy_right1))
+            seat_centers.append(((sx0 + sx1) / 2.0, (sy_right0 + sy_right1) / 2.0))
+
+        g._build_wall_segments()
+        return seat_centers
+
+    def load_laliki_bus_experiment(self) -> None:
+        """
+        Bus evacuation setup (Laliki-like): passengers start seated and react
+        nearly simultaneously once the alarm starts.
+        """
+        self.reset()
+
+        bus_center_x = self.cfg.length_m * 0.5
+        bus_center_y = self.cfg.width_m * 0.5
+        seat_positions = self._build_bus_layout(bus_center_x, bus_center_y)
+
+        # spawn passengers on seats
+        self._spawn_bus_passengers(seat_positions, self.cfg.bus_default_passengers)
+
+        # fire source near engine bay
+        self.schedule_event(
+            time_s=15.0,
+            kind="start_fire",
+            position_m=bus_center_x - 4.0,
+            y_m=bus_center_y,
+            growth_rate=0.03,
+            max_emission_rate=0.7,
+        )
+
+        # alarm at t=0 -> synchronized start
+        self.schedule_event(time_s=0.0, kind="start_voice_alarm")
+
+        # gentle longitudinal ventilation
+        self.schedule_event(time_s=5.0, kind="set_air_velocity", vx_mps=1.5, vy_mps=0.0)
+
+    def _spawn_bus_passengers(self, seat_positions: List[tuple[float, float]], count: int) -> None:
+        random.shuffle(seat_positions)
+        for idx, (x, y) in enumerate(seat_positions[:count]):
+            target_x, target_y = self.geometry.nearest_exit_point((x, y), fire_pos=None)
+            rt = random.uniform(0.2, 2.0)  # tight distribution -> simultaneous start
+            person = Person(
+                id=self._next_person_id,
+                x=x,
+                y=y,
+                radius_m=self.cfg.pedestrian_radius_m,
+                mass_kg=self.cfg.pedestrian_mass_kg,
+                desired_speed_clear=self.cfg.pedestrian_desired_speed_clear,
+                reaction_time_s=rt,
+                target_x=target_x,
+                target_y=target_y,
+                incapacitated_threshold=self.cfg.fed_incapacitated_threshold,
+            )
+            # they already know they must evacuate as soon as alarm starts
+            person.hazard_known_time_s = 0.0
+            self._next_person_id += 1
+            self.persons.append(person)
 
     def apply_tunnel_params(
         self,

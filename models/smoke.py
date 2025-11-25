@@ -1,9 +1,18 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Tuple, Protocol, Optional
 import numpy as np
 
 from config import EmiliaTunnelConfig, DEFAULT_CONFIG
+
+
+class FlowProvider(Protocol):
+    """Generic velocity provider (e.g. CFD / LBM / PySPH adapters)."""
+
+    def velocity_field(
+        self, field: "SmokeField", time_s: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        ...
 
 
 @dataclass
@@ -161,6 +170,9 @@ class SmokeField:
     fires: List[FireSource] = field(default_factory=list)
     fans: List[VentilationFan] = field(default_factory=list)
 
+    use_high_order: bool = False
+    external_flow_provider: Optional[FlowProvider] = field(default=None, repr=False)
+
     # „bazowy” przepływ (np. wymuszony podłużny)
     _base_vx: float = field(init=False)
     _base_vy: float = field(init=False)
@@ -187,6 +199,7 @@ class SmokeField:
             decay=cfg.smoke_decay,
             extinction_per_density=cfg.extinction_per_density,
             visibility_coefficient_m=cfg.visibility_coefficient_m,
+            use_high_order=cfg.use_high_order_advection,
         )
 
     # --- zarządzanie źródłami / wentylatorami ----------------------------
@@ -199,6 +212,10 @@ class SmokeField:
 
     def clear_fans(self) -> None:
         self.fans.clear()
+
+    def attach_external_flow_provider(self, provider: Optional[FlowProvider]) -> None:
+        """Attach/detach CFD/LBM/PySPH provider for velocity fields."""
+        self.external_flow_provider = provider
 
     def set_air_velocity(self, vx: float, vy: float, cfg: EmiliaTunnelConfig = DEFAULT_CONFIG):
         vmax = cfg.max_air_velocity_mps
@@ -220,6 +237,17 @@ class SmokeField:
 
         for fan in self.fans:
             fan.apply_velocity(self.u, self.v, self, time_s)
+
+        if self.external_flow_provider is not None:
+            try:
+                ext_u, ext_v = self.external_flow_provider.velocity_field(self, time_s)
+                if ext_u.shape == self.u.shape and ext_v.shape == self.v.shape:
+                    # blend external solver with base field
+                    self.u = 0.5 * (self.u + ext_u)
+                    self.v = 0.5 * (self.v + ext_v)
+            except Exception:
+                # Do not crash GUI if optional solver fails
+                pass
 
     # --- źródła dymu -----------------------------------------------------
 
@@ -288,6 +316,48 @@ class SmokeField:
 
         return s_new
 
+    def _advect_density_high_order(self, dt_s: float) -> np.ndarray:
+        """
+        BFECC (MacCormack-like) advection – reduced numerical diffusion.
+        It is still stable for interactive use but preserves gradients better
+        for dense plumes near the bus.
+        """
+        s_prev = self.density
+
+        # forward step
+        forward = self._advect_density(dt_s)
+
+        # backward step (reverse velocity)
+        u_back = -self.u
+        v_back = -self.v
+
+        s_back = np.zeros_like(s_prev)
+        for ix in range(self.nx):
+            x = ix * self.dx_m
+            for iy in range(self.ny):
+                y = iy * self.dy_m
+                vx = u_back[ix, iy]
+                vy = v_back[ix, iy]
+                x_prev = x - vx * dt_s
+                y_prev = y - vy * dt_s
+                s_back[ix, iy] = self._sample_density(forward, x_prev, y_prev)
+
+        corrected = s_prev + 0.5 * (s_prev - s_back)
+
+        # final advection using corrected field
+        s_final = np.zeros_like(s_prev)
+        for ix in range(self.nx):
+            x = ix * self.dx_m
+            for iy in range(self.ny):
+                y = iy * self.dy_m
+                vx = self.u[ix, iy]
+                vy = self.v[ix, iy]
+                x_prev = x - vx * dt_s
+                y_prev = y - vy * dt_s
+                s_final[ix, iy] = self._sample_density(corrected, x_prev, y_prev)
+
+        return s_final
+
     # --- główny krok dymu -----------------------------------------------
 
     def step(self, dt_s: float, time_s: float) -> None:
@@ -300,7 +370,10 @@ class SmokeField:
         self._build_velocity_field(time_s)
 
         # 2) adwekcja
-        self.density = self._advect_density(dt_s)
+        if getattr(self, "use_high_order", False):
+            self.density = self._advect_density_high_order(dt_s)
+        else:
+            self.density = self._advect_density(dt_s)
 
         # 3) dyfuzja + reszta
         s = self.density
