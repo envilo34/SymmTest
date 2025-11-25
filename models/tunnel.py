@@ -124,6 +124,32 @@ class TunnelGeometry:
                 return True
         return False
 
+    def resolve_obstacle_collision(
+        self, pos: Tuple[float, float], radius_m: float
+    ) -> Tuple[float, float]:
+        """Pushes a point agent outside rectangular obstacles if overlapping."""
+        px, py = pos
+        for obs in self.obstacles:
+            if (obs.x_min - radius_m <= px <= obs.x_max + radius_m) and (
+                obs.y_min - radius_m <= py <= obs.y_max + radius_m
+            ):
+                dx_left = (obs.x_min - radius_m) - px
+                dx_right = (obs.x_max + radius_m) - px
+                dy_bottom = (obs.y_min - radius_m) - py
+                dy_top = (obs.y_max + radius_m) - py
+
+                # Move by the smallest penetration depth
+                options = [
+                    (abs(dx_left), dx_left, 0.0),
+                    (abs(dx_right), dx_right, 0.0),
+                    (abs(dy_bottom), 0.0, dy_bottom),
+                    (abs(dy_top), 0.0, dy_top),
+                ]
+                _, fix_x, fix_y = min(options, key=lambda t: t[0])
+                px += fix_x
+                py += fix_y
+        return px, py
+
     # --- auxiliary to social force --------------------------------------
 
     def nearest_wall(

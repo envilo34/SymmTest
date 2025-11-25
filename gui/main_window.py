@@ -187,8 +187,9 @@ class MainWindow(QMainWindow):
         ):
             add_row.addWidget(w)
 
-        # default scenario
-        self.sim.load_emilia_student_experiment()
+        # default scenario – Laliki-inspired bus evacuation
+        if not self.sim.persons:
+            self.sim.load_laliki_bus_experiment()
         self.refresh_events_table()
         self.update_status_labels()
 

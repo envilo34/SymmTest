@@ -77,6 +77,19 @@ class EmiliaTunnelConfig:
     reaction_time_min: float = 5.0  # s
     reaction_time_max: float = 60.0  # s
 
+    # --- bus evacuation (Laliki experiment inspired) ---
+    bus_length_m: float = 12.0
+    bus_width_m: float = 2.55
+    bus_aisle_width_m: float = 0.6
+    bus_row_spacing_m: float = 0.75
+    bus_seat_depth_m: float = 0.5
+    bus_wall_thickness_m: float = 0.05
+    bus_door_width_m: float = 0.9
+    bus_default_passengers: int = 50
+
+    # --- numerics / advection ---
+    use_high_order_advection: bool = True
+
     # --- simulation time step ---
     dt_s: float = 0.1
 
